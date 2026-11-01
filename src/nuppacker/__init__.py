@@ -4,13 +4,11 @@ import struct
 import sys
 import traceback
 import unicodedata
-import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
