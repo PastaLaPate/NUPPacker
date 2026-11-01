@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""nup_packer_gui.py - Tkinter GUI that builds an Eden .nup from loose exefs/romfs trees."""
+"""nup_packer_gui.py - PySide6 GUI that builds an Eden .nup from loose exefs/romfs trees."""
 
-import hashlib, os, queue, struct, threading, traceback, uuid
-import tkinter as tk
+import hashlib, struct, sys, traceback, uuid
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+from PySide6.QtCore import QThread, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 NO_DIR = 0xFFFFFFFF
 CHUNK = 8 * 1024 * 1024
@@ -52,8 +68,7 @@ def resolve_inputs(folder: Path):
     """Accepts a package folder (has exefs/romfs) or a parent holding base/ [+ update/]."""
     if (folder / "exefs").is_dir() or (folder / "romfs").is_dir():
         return folder, None
-    base = folder / "base"
-    upd = folder / "update"
+    base, upd = folder / "base", folder / "update"
     if base.is_dir():
         return base, (upd if upd.is_dir() else None)
     return None, None
@@ -77,7 +92,7 @@ def parse_ver(s):
 
 
 def guess_title_id(folder: Path):
-    """Best-effort read of the program id from main.npdm (ACI0)."""
+    """Best-effort read of the program id from main.npdm (ACI0). Switch 1 layout assumed."""
     try:
         d = (folder / "exefs" / "main.npdm").read_bytes()
         if d[:4] != b"META":
@@ -106,8 +121,7 @@ class Pkg:
         npdm = path / "exefs" / "main.npdm"
         if npdm.is_file():
             m += tlv(0x0001, npdm.read_bytes())
-        m += meta
-        s.meta, s.meta_off = m, 0
+        s.meta, s.meta_off = m + meta, 0
 
 
 # ----------------------------------------------------------------- builder
@@ -151,18 +165,16 @@ def build_nup(cfg, log, progress):
                 tid,
                 parse_ver(cfg["update_version"]),
                 1 if (cfg["standalone"] or not base_dir) else 0,
-                disp,
+                disp + (b"" if base_dir else base_meta),
             )
         )
-        if not base_dir:  # standalone update: put title/icon there
-            pkgs[-1].meta += base_meta
-    log(f"Packages: {', '.join(('base' if p.kind == 0 else 'update') for p in pkgs)}")
+    log("Packages: " + ", ".join("base" if p.kind == 0 else "update" for p in pkgs))
 
     dirs, files = [], []
     for p in pkgs:
         collect(p.root, dirs, files)
     D, F, P = len(dirs), len(files), len(pkgs)
-    total_bytes = sum(f.path.stat().st_size for f in files)
+    total_bytes = max(sum(f.path.stat().st_size for f in files), 1)
     log(f"{D} dirs, {F} files, {total_bytes / 1e9:.2f} GB")
 
     children = []
@@ -194,12 +206,11 @@ def build_nup(cfg, log, progress):
             pos = align16(pos + len(p.meta))
     blob_off = pos
 
-    level = cfg["zstd"]
     cctx = None
-    if level > 0:
+    if cfg["zstd"] > 0:
         import zstandard
 
-        cctx = zstandard.ZstdCompressor(level=level)
+        cctx = zstandard.ZstdCompressor(level=cfg["zstd"])
 
     done = 0
     with open(cfg["output"], "wb") as out:
@@ -225,7 +236,7 @@ def build_nup(cfg, log, progress):
                 if csize < f.size:
                     stored_raw, f.codec, f.esize = False, 1, csize
                     done += f.size
-                else:  # not worth it -> raw
+                else:  # not smaller -> store raw
                     out.seek(start)
                     out.truncate()
             if stored_raw:
@@ -244,7 +255,7 @@ def build_nup(cfg, log, progress):
             f.sha = h.digest()
             f.eoff = start
             pos = start + f.esize
-            progress(done / max(total_bytes, 1))
+            progress(done / total_bytes)
         file_size = pos
 
         toc = struct.pack("<IIQQQQQ", 0x01434F54, P, D, F, pool_off, len(pool), 0)
@@ -313,191 +324,225 @@ def build_nup(cfg, log, progress):
     log(f"Done: {cfg['output']} ({file_size / 1e9:.2f} GB)")
 
 
+# ----------------------------------------------------------------- worker thread
+class BuildThread(QThread):
+    log = Signal(str)
+    progress = Signal(int)  # 0..1000
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+
+    def run(self):
+        try:
+            build_nup(
+                self.cfg, self.log.emit, lambda x: self.progress.emit(int(x * 1000))
+            )
+            self.finished_ok.emit()
+        except ImportError:
+            self.failed.emit(
+                "zstd needs the 'zstandard' package:  pip install zstandard"
+            )
+        except Exception as e:
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
 # ----------------------------------------------------------------- GUI
-class App(tk.Tk):
+class PathEdit(QWidget):
+    """Line edit + Browse button; accepts drag-and-drop of a path."""
+
+    def __init__(self, mode="dir", save_filter="", parent=None):
+        super().__init__(parent)
+        self.mode, self.save_filter = mode, save_filter
+        self.edit = QLineEdit()
+        btn = QPushButton("Browse…")
+        btn.clicked.connect(self.browse)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.edit, 1)
+        lay.addWidget(btn)
+        self.setAcceptDrops(True)
+        self.edit.setAcceptDrops(False)
+
+    def text(self):
+        return self.edit.text().strip()
+
+    def setText(self, t):
+        self.edit.setText(t)
+
+    def browse(self):
+        if self.mode == "dir":
+            p = QFileDialog.getExistingDirectory(self, "Select folder")
+        elif self.mode == "open":
+            p, _ = QFileDialog.getOpenFileName(self, "Select file")
+        else:
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Output file", "", self.save_filter
+            )
+        if p:
+            self.setText(p)
+            self.changed()
+
+    def changed(self):
+        pass
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        urls = e.mimeData().urls()
+        if urls:
+            self.setText(urls[0].toLocalFile())
+            self.changed()
+
+
+class FolderEdit(PathEdit):
+    def __init__(self, on_change, **kw):
+        super().__init__(**kw)
+        self._cb = on_change
+
+    def changed(self):
+        self._cb()
+
+
+class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.title("NUP Packer")
-        self.geometry("720x560")
-        self.q = queue.Queue()
-        self.v = {
-            k: tk.StringVar()
-            for k in (
-                "folder",
-                "update",
-                "output",
-                "title_id",
-                "title",
-                "version",
-                "update_version",
-                "display_version",
-                "icon",
-                "zstd",
-            )
-        }
-        self.v["version"].set("1.0.0")
-        self.v["update_version"].set("1.0.1")
-        self.v["zstd"].set("0")
-        self.standalone = tk.BooleanVar()
+        self.setWindowTitle("NUP Packer")
+        self.resize(720, 640)
+        self._thread = None
 
-        f = ttk.Frame(self, padding=10)
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(1, weight=1)
-        r = 0
-
-        def row(label, key, browse=None, extra=None):
-            nonlocal r
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            ttk.Entry(f, textvariable=self.v[key]).grid(
-                row=r, column=1, sticky="ew", pady=2, padx=4
-            )
-            if browse:
-                ttk.Button(f, text="Browse…", command=browse).grid(row=r, column=2)
-            if extra:
-                ttk.Button(f, text=extra[0], command=extra[1]).grid(row=r, column=2)
-            r += 1
-
-        row("Input folder (base or MKW)", "folder", self.pick_folder)
-        row("Update folder (optional)", "update", lambda: self.pick_dir("update"))
-        row("Output .nup", "output", self.pick_output)
-        row("Title ID (hex)", "title_id", extra=("Auto", self.auto_tid))
-        row("Title name", "title")
-        row("Base version", "version")
-        row("Update version", "update_version")
-        row("Display version", "display_version")
-        row("Icon (optional)", "icon", self.pick_icon)
-        row("zstd level (0 = raw)", "zstd")
-        ttk.Checkbutton(
-            f,
-            text="Standalone update (update has complete tree)",
-            variable=self.standalone,
-        ).grid(row=r, column=1, sticky="w")
-        r += 1
-
-        ttk.Label(f, text="Localized titles (lang=name, one per line)").grid(
-            row=r, column=0, columnspan=3, sticky="w"
+        self.folder = FolderEdit(self.on_folder, mode="dir")
+        self.update_folder = PathEdit("dir")
+        self.output = PathEdit("save", "NUP (*.nup)")
+        self.title_id = QLineEdit()
+        self.title_id.setPlaceholderText("0100ABCD00000000")
+        auto = QPushButton("Auto")
+        auto.clicked.connect(self.auto_tid)
+        tid_row = QHBoxLayout()
+        tid_row.addWidget(self.title_id, 1)
+        tid_row.addWidget(auto)
+        self.title = QLineEdit()
+        self.version = QLineEdit("1.0.0")
+        self.update_version = QLineEdit("1.0.1")
+        self.display_version = QLineEdit()
+        self.icon = PathEdit("open")
+        self.zstd = QSpinBox()
+        self.zstd.setRange(0, 22)
+        self.zstd.setSpecialValueText("0 (raw)")
+        self.standalone = QCheckBox(
+            "Standalone update (update contains the complete tree)"
         )
-        r += 1
-        self.loc = tk.Text(f, height=3)
-        self.loc.grid(row=r, column=0, columnspan=3, sticky="ew")
-        r += 1
+        self.loc = QPlainTextEdit()
+        self.loc.setFixedHeight(60)
+        self.loc.setPlaceholderText("fr=Mario Kart World\nja=マリオカート ワールド")
+        self.btn = QPushButton("Build NUP")
+        self.btn.clicked.connect(self.start)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.logbox = QPlainTextEdit()
+        self.logbox.setReadOnly(True)
 
-        self.btn = ttk.Button(f, text="Build NUP", command=self.start)
-        self.btn.grid(row=r, column=0, columnspan=3, pady=6)
-        r += 1
-        self.bar = ttk.Progressbar(f, maximum=1.0)
-        self.bar.grid(row=r, column=0, columnspan=3, sticky="ew")
-        r += 1
-        self.logbox = tk.Text(f, height=8, state="disabled")
-        self.logbox.grid(row=r, column=0, columnspan=3, sticky="nsew")
-        f.rowconfigure(r, weight=1)
-        self.after(100, self.poll)
+        form = QFormLayout()
+        form.addRow("Input folder (base or MKW)", self.folder)
+        form.addRow("Update folder (optional)", self.update_folder)
+        form.addRow("Output .nup", self.output)
+        form.addRow("Title ID (hex)", tid_row)
+        form.addRow("Title name", self.title)
+        form.addRow("Base version", self.version)
+        form.addRow("Update version", self.update_version)
+        form.addRow("Display version", self.display_version)
+        form.addRow("Icon (optional)", self.icon)
+        form.addRow("zstd level", self.zstd)
+        form.addRow("", self.standalone)
+        form.addRow(QLabel("Localized titles (lang=name, one per line)"))
+        form.addRow(self.loc)
 
-    # pickers
-    def pick_folder(self):
-        d = filedialog.askdirectory(title="Select base or MKW folder")
-        if d:
-            self.v["folder"].set(d)
-            if not self.v["title_id"].get():
-                self.auto_tid()
-            if not self.v["output"].get():
-                self.v["output"].set(
-                    str(Path(d).with_suffix(".nup"))
-                    if (Path(d) / "exefs").is_dir()
-                    else str(Path(d) / f"{Path(d).name}.nup")
-                )
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(self.btn)
+        lay.addWidget(self.bar)
+        lay.addWidget(self.logbox, 1)
 
-    def pick_dir(self, key):
-        d = filedialog.askdirectory()
-        if d:
-            self.v[key].set(d)
+    def log(self, msg):
+        self.logbox.appendPlainText(msg)
 
-    def pick_output(self):
-        p = filedialog.asksaveasfilename(
-            defaultextension=".nup", filetypes=[("NUP", "*.nup")]
-        )
-        if p:
-            self.v["output"].set(p)
-
-    def pick_icon(self):
-        p = filedialog.askopenfilename()
-        if p:
-            self.v["icon"].set(p)
+    def on_folder(self):
+        d = self.folder.text()
+        if not d:
+            return
+        if not self.title_id.text():
+            self.auto_tid()
+        if not self.output.text():
+            p = Path(d)
+            self.output.setText(
+                str(p.with_suffix(".nup"))
+                if (p / "exefs").is_dir()
+                else str(p / f"{p.name}.nup")
+            )
 
     def auto_tid(self):
-        folder = self.v["folder"].get()
+        folder = self.folder.text()
         if not folder:
             return
         base, _ = resolve_inputs(Path(folder))
         tid = guess_title_id(base) if base else ""
         if tid:
-            self.v["title_id"].set(tid)
+            self.title_id.setText(tid)
         else:
             self.log("Couldn't read title ID from main.npdm; enter it manually.")
 
-    # logging / progress
-    def log(self, msg):
-        self.q.put(("log", msg))
-
-    def prog(self, x):
-        self.q.put(("prog", x))
-
-    def poll(self):
-        try:
-            while True:
-                kind, val = self.q.get_nowait()
-                if kind == "log":
-                    self.logbox.config(state="normal")
-                    self.logbox.insert("end", val + "\n")
-                    self.logbox.see("end")
-                    self.logbox.config(state="disabled")
-                elif kind == "prog":
-                    self.bar["value"] = val
-                elif kind == "end":
-                    self.btn.config(state="normal")
-                    if val:
-                        messagebox.showerror("Error", val)
-        except queue.Empty:
-            pass
-        self.after(100, self.poll)
-
-    # run
     def start(self):
         try:
             loc = []
-            for line in self.loc.get("1.0", "end").splitlines():
+            for line in self.loc.toPlainText().splitlines():
                 if "=" in line:
                     l, t = line.split("=", 1)
                     loc.append((l.strip(), t.strip()))
-            cfg = {k: v.get().strip() for k, v in self.v.items()}
-            cfg["zstd"] = int(cfg["zstd"] or 0)
-            cfg["standalone"] = self.standalone.get()
-            cfg["loc_titles"] = loc
+            cfg = {
+                "folder": self.folder.text(),
+                "update": self.update_folder.text(),
+                "output": self.output.text(),
+                "title_id": self.title_id.text().strip(),
+                "title": self.title.text().strip(),
+                "version": self.version.text().strip(),
+                "update_version": self.update_version.text().strip(),
+                "display_version": self.display_version.text().strip(),
+                "icon": self.icon.text(),
+                "zstd": self.zstd.value(),
+                "standalone": self.standalone.isChecked(),
+                "loc_titles": loc,
+            }
             if not cfg["folder"] or not cfg["output"] or not cfg["title_id"]:
                 raise ValueError("Input folder, output file and title ID are required.")
             int(cfg["title_id"], 16)
         except Exception as e:
-            messagebox.showerror("Invalid input", str(e))
+            QMessageBox.critical(self, "Invalid input", str(e))
             return
-        self.btn.config(state="disabled")
-        self.bar["value"] = 0
-        threading.Thread(target=self.work, args=(cfg,), daemon=True).start()
+        self.btn.setEnabled(False)
+        self.bar.setValue(0)
+        self._thread = BuildThread(cfg, self)
+        self._thread.log.connect(self.log)
+        self._thread.progress.connect(self.bar.setValue)
+        self._thread.finished_ok.connect(lambda: self.btn.setEnabled(True))
+        self._thread.failed.connect(self.on_failed)
+        self._thread.start()
 
-    def work(self, cfg):
-        err = ""
-        try:
-            build_nup(cfg, self.log, self.prog)
-        except ImportError:
-            err = "zstd needs the 'zstandard' package:  pip install zstandard"
-        except Exception as e:
-            err = str(e)
-            self.log(traceback.format_exc())
-        self.q.put(("end", err))
+    def on_failed(self, msg):
+        self.btn.setEnabled(True)
+        QMessageBox.critical(self, "Error", msg)
 
 
 def main():
-    App().mainloop()
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    main()
