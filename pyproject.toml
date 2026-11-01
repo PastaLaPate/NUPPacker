@@ -3,17 +3,21 @@ name = "nuppacker"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "PastaLaPate", email = "pastalapate@proton.me" }
-]
 requires-python = ">=3.14"
+authors = [{ name = "PastaLaPate", email = "pastalapate@proton.me" }]
 dependencies = [
-    "pyside6>=6.12.0",
-    "zstandard>=0.25.0",
+  "pyside6>=6.12.0",
+  "zstandard>=0.25.0",
 ]
 
 [project.scripts]
 nuppacker = "nuppacker:main"
+
+[dependency-groups]
+dev = [
+  "pyinstaller>=6.22.3",
+]
+build = ["pyinstaller>=6.22.3"]
 
 [build-system]
 requires = ["uv_build>=0.13.3,<0.14.0"]
