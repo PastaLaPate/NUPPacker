@@ -33,6 +33,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+build = [
+    { name = "pyinstaller" },
+]
 dev = [
     { name = "pyinstaller" },
 ]
@@ -44,6 +47,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+build = [{ name = "pyinstaller", specifier = ">=6.22.3" }]
 dev = [{ name = "pyinstaller", specifier = ">=6.22.3" }]
 
 [[package]]

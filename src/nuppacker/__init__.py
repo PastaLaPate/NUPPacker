@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """nup_packer_gui.py - PySide6 GUI that builds an Eden .nup from loose exefs/romfs trees."""
 
+import os
+
 import hashlib, struct, sys, traceback, uuid
 from pathlib import Path
 
@@ -213,10 +215,13 @@ def build_nup(cfg, log, progress):
         cctx = zstandard.ZstdCompressor(level=cfg["zstd"])
 
     done = 0
-    with open(cfg["output"], "wb") as out:
+    part = cfg["output"] + ".part"
+    with open(part, "wb") as out:
         out.seek(blob_off)
         for f in files:
             f.size = f.path.stat().st_size
+            if f.size > (256 << 20):
+                log(f"Packing {f.path.name} ({f.size / 1e9:.2f} GB)")
             if f.size == 0:
                 f.sha = hashlib.sha256(b"").digest()
                 continue
@@ -321,6 +326,7 @@ def build_nup(cfg, log, progress):
                 out.seek(p.meta_off)
                 out.write(p.meta)
         out.truncate(file_size)
+    os.replace(part, cfg["output"])
     log(f"Done: {cfg['output']} ({file_size / 1e9:.2f} GB)")
 
 
@@ -528,7 +534,12 @@ class MainWindow(QWidget):
         self._thread = BuildThread(cfg, self)
         self._thread.log.connect(self.log)
         self._thread.progress.connect(self.bar.setValue)
-        self._thread.finished_ok.connect(lambda: self.btn.setEnabled(True))
+        self._thread.finished_ok.connect(
+            lambda: (
+                self.btn.setEnabled(True),
+                QMessageBox.information(self, "NUP Packer", "Done."),
+            )
+        )
         self._thread.failed.connect(self.on_failed)
         self._thread.start()
 
