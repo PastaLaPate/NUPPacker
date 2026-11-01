@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
-"""nup_packer_gui.py - PySide6 GUI that builds an Eden .nup from loose exefs/romfs trees."""
-
+import hashlib
 import os
-
-import hashlib, struct, sys, traceback, uuid
+import struct
+import sys
+import traceback
+import unicodedata
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -45,13 +46,19 @@ class File:
         s.esize = 0
 
 
+RESERVED = {".listing"}
+
+
 def scan(path, name):
     d = Dir(name)
-    for e in sorted(path.iterdir(), key=lambda p: p.name):
+    for e in path.iterdir():
+        if e.name in RESERVED:
+            continue
+        n = unicodedata.normalize("NFC", e.name)
         if e.is_dir():
-            d.dirs.append(scan(e, e.name))
+            d.dirs.append(scan(e, n))
         elif e.is_file():
-            d.files.append(File(e.name, e))
+            d.files.append(File(n, e))
     return d
 
 
@@ -81,15 +88,55 @@ def tlv(t, payload):
 
 
 def loc_block(items):
-    out = b""
+    seen, out = set(), b""
     for lang, data in items:
-        l = lang.lower().encode()
-        out += bytes([len(l)]) + l + struct.pack("<I", len(data)) + data
+        l = lang.strip().lower()
+        if not l or l in seen:
+            raise ValueError(f"Empty or duplicate language tag: {lang!r}")
+        seen.add(l)
+        lb = l.encode()
+        out += bytes([len(lb)]) + lb + struct.pack("<I", len(data)) + data
     return out
 
 
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        while c := f.read(CHUNK):
+            h.update(c)
+    return h.digest()
+
+
+def app_meta(cfg, base_dir):
+    m = b""
+
+    if cfg.get("nacp"):
+        m += tlv(0x0002, Path(cfg["nacp"]).read_bytes())
+    if cfg["icon"]:
+        m += tlv(0x0003, Path(cfg["icon"]).read_bytes())
+    if cfg["title"]:
+        m += tlv(0x0005, cfg["title"].encode())
+    if cfg.get("publisher"):
+        m += tlv(0x0006, cfg["publisher"].encode())
+    if base_dir and (base_dir / "exefs" / "main").is_file():
+        m += tlv(0x0007, sha256_file(base_dir / "exefs" / "main"))
+    m += tlv(0x0008, Path(cfg["folder"]).name.encode())
+    if cfg.get("loc_titles"):
+        m += tlv(0x0009, loc_block([(l, t.encode()) for l, t in cfg["loc_titles"]]))
+    if cfg.get("loc_icons"):
+        m += tlv(
+            0x000A, loc_block([(l, Path(p).read_bytes()) for l, p in cfg["loc_icons"]])
+        )
+    return m
+
+
 def parse_ver(s):
-    a = [int(x) for x in s.strip().split(".") if x] + [0, 0, 0]
+    s = s.strip()
+    if s.lower().startswith("0x"):
+        return int(s, 16)
+    if "." not in s:  # raw NCM version, e.g. 458752
+        return int(s)
+    a = [int(x) for x in s.split(".")] + [0, 0, 0]
     return ((a[0] & 0xFFFF) << 16) | ((a[1] & 0xFF) << 8) | (a[2] & 0xFF)
 
 
@@ -119,6 +166,8 @@ class Pkg:
         if (path / "romfs").is_dir():
             s.romfs = scan(path / "romfs", "romfs")
             s.root.dirs.append(s.romfs)
+        if (path / "data").is_dir():
+            s.root.dirs.append(scan(path / "data", "data"))
         m = b""
         npdm = path / "exefs" / "main.npdm"
         if npdm.is_file():
@@ -134,15 +183,7 @@ def build_nup(cfg, log, progress):
         raise ValueError("Input folder has no exefs/romfs and no base/ subfolder.")
     tid = int(cfg["title_id"], 16)
 
-    base_meta = b""
-    if cfg["icon"]:
-        base_meta += tlv(0x0003, Path(cfg["icon"]).read_bytes())
-    if cfg["title"]:
-        base_meta += tlv(0x0005, cfg["title"].encode())
-    if cfg["loc_titles"]:
-        base_meta += tlv(
-            0x0009, loc_block([(l, t.encode()) for l, t in cfg["loc_titles"]])
-        )
+    base_meta = app_meta(cfg, base_dir)
     disp = (
         tlv(0x0004, cfg["display_version"].encode()) if cfg["display_version"] else b""
     )
@@ -164,9 +205,9 @@ def build_nup(cfg, log, progress):
             Pkg(
                 upd_dir,
                 1,
-                tid,
+                tid | 0x800,
                 parse_ver(cfg["update_version"]),
-                1 if (cfg["standalone"] or not base_dir) else 0,
+                0 if base_dir else 1,
                 disp + (b"" if base_dir else base_meta),
             )
         )
@@ -182,8 +223,12 @@ def build_nup(cfg, log, progress):
     children = []
     for d in dirs:
         d.first = len(children)
-        children += [s.idx for s in d.dirs] + [D + f.idx for f in d.files]
-        d.count = len(children) - d.first
+        nodes = sorted(
+            [(s.name.encode(), s.idx) for s in d.dirs]
+            + [(f.name.encode(), D + f.idx) for f in d.files]
+        )
+        children += [i for _, i in nodes]
+        d.count = len(nodes)
 
     pool, pmap = bytearray(), {}
 
@@ -199,7 +244,7 @@ def build_nup(cfg, log, progress):
         intern(f.name)
 
     pool_off = 0x30 + P * 0x40 + D * 0x18 + F * 0x50 + 4 * len(children)
-    toc_size = pool_off + len(pool)
+    toc_size = align16(pool_off + len(pool))
 
     pos = align16(0x80 + toc_size)
     for p in pkgs:
@@ -218,6 +263,7 @@ def build_nup(cfg, log, progress):
     part = cfg["output"] + ".part"
     with open(part, "wb") as out:
         out.seek(blob_off)
+        seen = {}
         for f in files:
             f.size = f.path.stat().st_size
             if f.size > (256 << 20):
@@ -225,6 +271,7 @@ def build_nup(cfg, log, progress):
             if f.size == 0:
                 f.sha = hashlib.sha256(b"").digest()
                 continue
+            before = pos
             pad = (-pos) % 16
             out.write(b"\0" * pad)
             pos += pad
@@ -258,8 +305,17 @@ def build_nup(cfg, log, progress):
                 if cctx:
                     done += f.size
             f.sha = h.digest()
-            f.eoff = start
-            pos = start + f.esize
+            key = (f.sha, f.size)
+            if key in seen:  # identical content already stored
+                f.eoff, f.esize, f.codec = seen[key]
+                out.seek(before)
+                out.truncate()  # drop the copy we just wrote
+                pos = before
+            else:
+                f.eoff = start
+                seen[key] = (start, f.esize, f.codec)
+                pos = start + f.esize
+            progress(done / total_bytes)
             progress(done / total_bytes)
         file_size = pos
 
@@ -300,7 +356,12 @@ def build_nup(cfg, log, progress):
                 b"\0" * 8,
             )
         toc += struct.pack(f"<{len(children)}I", *children) + bytes(pool)
+        toc = toc.ljust(toc_size, b"\0")
         assert len(toc) == toc_size
+
+        uh = hashlib.sha256()
+        for p in pkgs:
+            uh.update(struct.pack("<QIB", p.title_id, p.version, p.kind))
 
         sup = struct.pack(
             "<4sHHQQ32sQQII16s32s",
@@ -314,7 +375,7 @@ def build_nup(cfg, log, progress):
             file_size,
             P,
             0,
-            uuid.uuid4().bytes,
+            uh.digest()[:16],
             b"\0" * 32,
         )
         assert len(sup) == 0x80
@@ -440,9 +501,6 @@ class MainWindow(QWidget):
         self.zstd = QSpinBox()
         self.zstd.setRange(0, 22)
         self.zstd.setSpecialValueText("0 (raw)")
-        self.standalone = QCheckBox(
-            "Standalone update (update contains the complete tree)"
-        )
         self.loc = QPlainTextEdit()
         self.loc.setFixedHeight(60)
         self.loc.setPlaceholderText("fr=Mario Kart World\nja=マリオカート ワールド")
@@ -464,7 +522,6 @@ class MainWindow(QWidget):
         form.addRow("Display version", self.display_version)
         form.addRow("Icon (optional)", self.icon)
         form.addRow("zstd level", self.zstd)
-        form.addRow("", self.standalone)
         form.addRow(QLabel("Localized titles (lang=name, one per line)"))
         form.addRow(self.loc)
 
@@ -520,7 +577,6 @@ class MainWindow(QWidget):
                 "display_version": self.display_version.text().strip(),
                 "icon": self.icon.text(),
                 "zstd": self.zstd.value(),
-                "standalone": self.standalone.isChecked(),
                 "loc_titles": loc,
             }
             if not cfg["folder"] or not cfg["output"] or not cfg["title_id"]:
