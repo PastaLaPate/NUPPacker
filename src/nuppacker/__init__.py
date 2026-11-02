@@ -524,7 +524,11 @@ class PathEdit(QWidget):
         if self.mode == "dir":
             p = QFileDialog.getExistingDirectory(self, "Select folder")
         elif self.mode == "open":
-            p, _ = QFileDialog.getOpenFileName(self, "Select file")
+            p, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select file",
+                filter=self.save_filter,
+            )
         else:
             p, _ = QFileDialog.getSaveFileName(
                 self, "Output file", "", self.save_filter
@@ -578,7 +582,7 @@ class MainWindow(QWidget):
         self.version = QLineEdit("1.0.0")
         self.update_version = QLineEdit("1.0.1")
         self.display_version = QLineEdit()
-        self.icon = PathEdit("open")
+        self.icon = PathEdit("open", save_filter="Images (*.png *.jpg *.jpeg)")
         self.zstd = QSpinBox()
         self.zstd.setRange(0, 22)
         self.zstd.setSpecialValueText("0 (raw)")
