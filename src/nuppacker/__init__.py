@@ -318,9 +318,11 @@ def build_nup(cfg, log, progress):
         file_size = pos
 
         toc = struct.pack("<IIQQQQQ", 0x01434F54, P, D, F, pool_off, len(pool), 0)
-        for p in pkgs:
+
+        log("Writing TOC PKGs")
+        for i, p in enumerate(pkgs):
             toc += struct.pack(
-                "<QIIIIBBHQII20s",
+                "<QIIIIBBHIQI20s",
                 p.title_id,
                 p.root.idx,
                 p.exefs.idx if p.exefs else NO_DIR,
@@ -328,31 +330,39 @@ def build_nup(cfg, log, progress):
                 p.version,
                 p.kind,
                 p.flags,
-                0,
-                p.meta_off,
-                len(p.meta),
-                0,
-                b"\0" * 20,
+                0,  # 0x18 kind, 0x19 flags, 0x1A reserved
+                0,  # 0x1C reserved2
+                p.meta_off,  # 0x20 meta_offset
+                len(p.meta),  # 0x28 meta_size
+                b"\0" * 20,  # 0x2C reserved3
             )
-        for d in dirs:
+            progress(i / len(pkgs))
+
+        log("Writing TOC Dirs")
+        for i, d in enumerate(dirs):
             no, nl = pmap[d.name]
             toc += struct.pack("<IIIIQ", no, nl, d.first, d.count, 0)
-        for f in files:
+            progress(i / len(dirs))
+
+        log("Writing TOC Filse")
+        for i, f in enumerate(files):
             no, nl = pmap[f.name]
             toc += struct.pack(
-                "<IIIQ32sQQBBH8s",
+                "<IIQQQ32sBBH12s",
                 no,
-                nl,
-                0,
-                f.size,
-                f.sha,
-                f.eoff,
-                f.esize,
+                nl,  # 0x00 name_offset, 0x04 name_length
+                f.size,  # 0x08
+                f.eoff,  # 0x10
+                f.esize,  # 0x18
+                f.sha,  # 0x20
                 f.codec,
                 0,
-                0,
-                b"\0" * 8,
+                0,  # 0x40 codec, 0x41 codec_flags, 0x42 reserved2
+                b"\0" * 12,  # 0x44 reserved3
             )
+            progress(i / len(files))
+
+        log("Finalizing...")
         toc += struct.pack(f"<{len(children)}I", *children) + bytes(pool)
         toc = toc.ljust(toc_size, b"\0")
         assert len(toc) == toc_size
