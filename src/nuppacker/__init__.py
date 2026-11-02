@@ -317,55 +317,55 @@ def build_nup(cfg, log, progress):
             progress(done / total_bytes)
         file_size = pos
 
-        toc = struct.pack("<IIQQQQQ", 0x01434F54, P, D, F, pool_off, len(pool), 0)
+        PKG_S = struct.Struct("<QIIIIBBHIQI20s")  # 0x40
+        DIR_S = struct.Struct("<IIIIQ")  # 0x18
+        FILE_S = struct.Struct("<IIQQQ32sBBH12s")  # 0x50
+        assert (PKG_S.size, DIR_S.size, FILE_S.size) == (0x40, 0x18, 0x50)
 
-        log("Writing TOC PKGs")
+        log("Building table of contents…")
+        parts = [struct.pack("<IIQQQQQ", 0x01434F54, P, D, F, pool_off, len(pool), 0)]
+        log("Preparing packages")
         for i, p in enumerate(pkgs):
-            toc += struct.pack(
-                "<QIIIIBBHIQI20s",
-                p.title_id,
-                p.root.idx,
-                p.exefs.idx if p.exefs else NO_DIR,
-                p.romfs.idx if p.romfs else NO_DIR,
-                p.version,
-                p.kind,
-                p.flags,
-                0,  # 0x18 kind, 0x19 flags, 0x1A reserved
-                0,  # 0x1C reserved2
-                p.meta_off,  # 0x20 meta_offset
-                len(p.meta),  # 0x28 meta_size
-                b"\0" * 20,  # 0x2C reserved3
+            parts.append(
+                PKG_S.pack(
+                    p.title_id,
+                    p.root.idx,
+                    p.exefs.idx if p.exefs else NO_DIR,
+                    p.romfs.idx if p.romfs else NO_DIR,
+                    p.version,
+                    p.kind,
+                    p.flags,
+                    0,
+                    0,
+                    p.meta_off,
+                    len(p.meta),
+                    b"\0" * 20,
+                )
             )
             progress(i / len(pkgs))
 
-        log("Writing TOC Dirs")
+        log("Preparing directories")
         for i, d in enumerate(dirs):
             no, nl = pmap[d.name]
-            toc += struct.pack("<IIIIQ", no, nl, d.first, d.count, 0)
+            parts.append(DIR_S.pack(no, nl, d.first, d.count, 0))
             progress(i / len(dirs))
 
-        log("Writing TOC Filse")
+        log("Preparing Files")
         for i, f in enumerate(files):
             no, nl = pmap[f.name]
-            toc += struct.pack(
-                "<IIQQQ32sBBH12s",
-                no,
-                nl,  # 0x00 name_offset, 0x04 name_length
-                f.size,  # 0x08
-                f.eoff,  # 0x10
-                f.esize,  # 0x18
-                f.sha,  # 0x20
-                f.codec,
-                0,
-                0,  # 0x40 codec, 0x41 codec_flags, 0x42 reserved2
-                b"\0" * 12,  # 0x44 reserved3
+            parts.append(
+                FILE_S.pack(
+                    no, nl, f.size, f.eoff, f.esize, f.sha, f.codec, 0, 0, b"\0" * 12
+                )
             )
             progress(i / len(files))
-
-        log("Finalizing...")
-        toc += struct.pack(f"<{len(children)}I", *children) + bytes(pool)
-        toc = toc.ljust(toc_size, b"\0")
+        log("Writing TOC")
+        parts.append(struct.pack(f"<{len(children)}I", *children))
+        parts.append(bytes(pool))
+        toc = b"".join(parts).ljust(toc_size, b"\0")
         assert len(toc) == toc_size
+        log(f"TOC: {len(toc) / 1e6:.1f} MB")
+        log("Finalizing...")
 
         uh = hashlib.sha256()
         for p in pkgs:
