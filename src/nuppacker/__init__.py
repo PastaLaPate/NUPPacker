@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import struct
 import sys
 import traceback
@@ -71,14 +72,118 @@ def collect(d, dirs, files):
 
 
 # ----------------------------------------------------------------- helpers
-def resolve_inputs(folder: Path):
-    """Accepts a package folder (has exefs/romfs) or a parent holding base/ [+ update/]."""
-    if (folder / "exefs").is_dir() or (folder / "romfs").is_dir():
-        return folder, None
-    base, upd = folder / "base", folder / "update"
-    if base.is_dir():
-        return base, (upd if upd.is_dir() else None)
-    return None, None
+HEX16 = re.compile(r"^[0-9A-Fa-f]{16}$")
+
+
+def is_pkg_dir(p: Path):
+    return p.is_dir() and any((p / n).is_dir() for n in ("exefs", "romfs", "data"))
+
+
+def parse_version_name(name):
+    n = name.lower().lstrip("v")
+    try:
+        return int(n, 16) if n.startswith("0x") else int(n)
+    except ValueError:
+        return None
+
+
+def version_dirs(root: Path):
+    """root is a package dir -> [(None, root)]; else numeric subfolders that are package dirs."""
+    if is_pkg_dir(root):
+        return [(None, root)]
+    out = []
+    for c in root.iterdir():
+        v = parse_version_name(c.name)
+        if v is not None and is_pkg_dir(c):
+            out.append((v, c))
+    return sorted(out)
+
+
+def discover_dlc(dlc: Path):
+    if HEX16.match(dlc.name):  # user picked a single add-on folder
+        return [(2, int(dlc.name, 16), v, p) for v, p in version_dirs(dlc)]
+    out = []
+    for t in sorted(dlc.iterdir()):
+        if t.is_dir() and HEX16.match(t.name):
+            out += [(2, int(t.name, 16), v, p) for v, p in version_dirs(t)]
+    return out
+
+
+def discover(folder: Path):
+    """Returns [(kind, title_id|None, version|None, path)]."""
+    if is_pkg_dir(folder):
+        return [(0, None, None, folder)]
+    specs = []
+    if is_pkg_dir(folder / "base"):
+        specs.append((0, None, None, folder / "base"))
+    if (folder / "updates").is_dir():
+        specs += [(1, None, v, p) for v, p in version_dirs(folder / "updates")]
+    for n in ("dlc", "addon"):
+        if (folder / n).is_dir():
+            specs += discover_dlc(folder / n)
+    if not specs:  # user picked update/ or dlc/ directly
+        specs = [(1, None, v, p) for v, p in version_dirs(folder)] or discover_dlc(
+            folder
+        )
+    return specs
+
+
+KIND_NAMES = {0: "base", 1: "update", 2: "dlc"}
+ver_str = lambda v: f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
+
+
+def plan_packages(cfg, log):
+    tid = int(cfg["title_id"], 16)
+    specs = discover(Path(cfg["folder"]))
+    if cfg["update"]:
+        specs += [(1, None, v, p) for v, p in version_dirs(Path(cfg["update"]))]
+    if cfg["dlc"]:
+        specs += discover_dlc(Path(cfg["dlc"]))
+    if not specs:
+        raise ValueError(
+            "No packages found: expected base/, update/<version>/, dlc/<titleid>/ "
+            "(or a folder that directly contains exefs/ or romfs/)."
+        )
+    bases = [s for s in specs if s[0] == 0]
+    if len(bases) > 1:
+        raise ValueError("More than one base package.")
+    has_base = bool(bases)
+
+    norm = []
+    for kind, ptid, ver, path in specs:
+        if kind == 0:
+            ptid, ver = tid, parse_ver(cfg["version"])
+        elif kind == 1:
+            ptid = tid | 0x800
+            ver = ver if ver is not None else parse_ver(cfg["update_version"])
+        else:
+            if ptid is None:
+                raise ValueError(
+                    f"{path}: DLC needs a 16-hex-digit title ID folder name."
+                )
+            ver = ver or 0
+        norm.append((kind, ptid, ver, path))
+    norm.sort(key=lambda s: (s[0], s[2]))
+    keys = [(k, t, v) for k, t, v, _ in norm]
+    if len(set(keys)) != len(keys):
+        raise ValueError("Two packages share the same kind, title ID and version.")
+
+    updates = [s for s in norm if s[0] == 1]
+    best_update = updates[-1] if updates else None
+    disp_target = best_update or norm[0]
+    pkgs = []
+    for s in norm:
+        kind, ptid, ver, path = s
+        meta = b""
+        if kind == 0 or (not has_base and s is best_update):  # app-level metadata
+            meta += app_meta(cfg, path)
+        if cfg["display_version"] and s is disp_target:
+            meta += tlv(0x0004, cfg["display_version"].encode())
+        pkgs.append(
+            Pkg(path, kind, ptid, ver, 1 if (kind == 1 and not has_base) else 0, meta)
+        )
+        log(f"  {KIND_NAMES[kind]:6} {ptid:016X}  v{ver} ({ver_str(ver)})  {path}")
+    return pkgs
 
 
 def tlv(t, payload):
@@ -175,40 +280,7 @@ class Pkg:
 
 # ----------------------------------------------------------------- builder
 def build_nup(cfg, log, progress):
-    base_dir, auto_upd = resolve_inputs(Path(cfg["folder"]))
-    upd_dir = Path(cfg["update"]) if cfg["update"] else auto_upd
-    if base_dir is None and not upd_dir:
-        raise ValueError("Input folder has no exefs/romfs and no base/ subfolder.")
-    tid = int(cfg["title_id"], 16)
-
-    base_meta = app_meta(cfg, base_dir)
-    disp = (
-        tlv(0x0004, cfg["display_version"].encode()) if cfg["display_version"] else b""
-    )
-
-    pkgs = []
-    if base_dir:
-        pkgs.append(
-            Pkg(
-                base_dir,
-                0,
-                tid,
-                parse_ver(cfg["version"]),
-                0,
-                base_meta + (b"" if upd_dir else disp),
-            )
-        )
-    if upd_dir:
-        pkgs.append(
-            Pkg(
-                upd_dir,
-                1,
-                tid | 0x800,
-                parse_ver(cfg["update_version"]),
-                0 if base_dir else 1,
-                disp + (b"" if base_dir else base_meta),
-            )
-        )
+    pkgs = plan_packages(cfg, log)
     log("Packages: " + ", ".join("base" if p.kind == 0 else "update" for p in pkgs))
 
     dirs, files = [], []
@@ -494,6 +566,7 @@ class MainWindow(QWidget):
         self.folder = FolderEdit(self.on_folder, mode="dir")
         self.update_folder = PathEdit("dir")
         self.output = PathEdit("save", "NUP (*.nup)")
+        self.dlc_folder = PathEdit("dir")
         self.title_id = QLineEdit()
         self.title_id.setPlaceholderText("0100ABCD00000000")
         auto = QPushButton("Auto")
@@ -521,7 +594,8 @@ class MainWindow(QWidget):
 
         form = QFormLayout()
         form.addRow("Input folder (base or MKW)", self.folder)
-        form.addRow("Update folder (optional)", self.update_folder)
+        form.addRow("Extra updates folder (optional)", self.update_folder)
+        form.addRow("DLC folder (optional)", self.dlc_folder)
         form.addRow("Output .nup", self.output)
         form.addRow("Title ID (hex)", tid_row)
         form.addRow("Title name", self.title)
@@ -555,13 +629,19 @@ class MainWindow(QWidget):
                 if (p / "exefs").is_dir()
                 else str(p / f"{p.name}.nup")
             )
+        for k, t, v, p in discover(Path(d)):
+            self.log(
+                f"found {KIND_NAMES[k]}: {p}"
+                + (f"  (version {v})" if v is not None else "")
+            )
 
     def auto_tid(self):
         folder = self.folder.text()
         if not folder:
             return
-        base, _ = resolve_inputs(Path(folder))
-        tid = guess_title_id(base) if base else ""
+        specs = discover(Path(folder))
+        path = specs[0][3] if specs else None
+        tid = guess_title_id(path) if path else ""
         if tid:
             self.title_id.setText(tid)
         else:
@@ -577,6 +657,7 @@ class MainWindow(QWidget):
             cfg = {
                 "folder": self.folder.text(),
                 "update": self.update_folder.text(),
+                "dlc": self.dlc_folder.text(),
                 "output": self.output.text(),
                 "title_id": self.title_id.text().strip(),
                 "title": self.title.text().strip(),
