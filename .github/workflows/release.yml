@@ -3,6 +3,7 @@ name: Build & Release
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -81,8 +82,33 @@ jobs:
           name: linux
           path: NUP-Packer-x86_64.AppImage
 
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --frozen --group build
+      - name: Build DMG
+        run: bash packaging/build-macos-dmg.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/NUP-Packer-macos-${{ matrix.arch }}.dmg
+
   release:
-    needs: [windows, linux]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -104,3 +130,5 @@ jobs:
           files: |
             artifacts/nuppacker-windows-portable.zip
             artifacts/NUP-Packer-x86_64.AppImage
+            artifacts/NUP-Packer-macos-x86_64.dmg
+            artifacts/NUP-Packer-macos-arm64.dmg
